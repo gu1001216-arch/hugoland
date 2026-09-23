@@ -28,6 +28,7 @@ DEFAULT_MONITORS = [
     {"name": "1 e 2", "values": ["s1", "s2"], "mode": "any", "alert": 0},
     {"name": "10", "values": ["s10"], "mode": "any", "alert": 25},
     {"name": "Bônus", "values": ["b2w", "b5w", "bwolter", "bdice"], "mode": "any", "alert": 30},
+    {"name": "1 1 (dois 1 seguidos)", "values": ["s1"], "mode": "rep", "rep": 2, "alert": 0},
 ]
 
 SCHEMA = """
@@ -46,8 +47,10 @@ CREATE TABLE IF NOT EXISTS monitors (
     vals  JSONB NOT NULL,
     mode  TEXT NOT NULL DEFAULT 'any',
     alert INTEGER NOT NULL DEFAULT 0,
+    rep   INTEGER NOT NULL DEFAULT 2,
     pos   INTEGER NOT NULL DEFAULT 0
 );
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS rep INTEGER NOT NULL DEFAULT 2;
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value JSONB NOT NULL
@@ -94,8 +97,8 @@ class Store:
                 c.execute("INSERT INTO settings(key, value) VALUES ('segments', %s)", (Jsonb(DEFAULT_SEGMENTS),))
             if not c.execute("SELECT 1 FROM settings WHERE key='seeded'").fetchone():
                 for i, m in enumerate(DEFAULT_MONITORS):
-                    c.execute("INSERT INTO monitors(id,name,vals,mode,alert,pos) VALUES (%s,%s,%s,%s,%s,%s)",
-                              (uuid.uuid4().hex[:10], m["name"], Jsonb(m["values"]), m["mode"], m["alert"], i))
+                    c.execute("INSERT INTO monitors(id,name,vals,mode,alert,rep,pos) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                              (uuid.uuid4().hex[:10], m["name"], Jsonb(m["values"]), m["mode"], m["alert"], m.get("rep", 2), i))
                 c.execute("INSERT INTO settings(key, value) VALUES ('seeded', 'true')")
         self.reload_config()
         self.full_reload()
@@ -103,8 +106,8 @@ class Store:
     def reload_config(self):
         with connect() as c:
             self.segments = c.execute("SELECT value FROM settings WHERE key='segments'").fetchone()[0]
-            rows = c.execute("SELECT id,name,vals,mode,alert FROM monitors ORDER BY pos, name").fetchall()
-        self.monitors = [{"id": r[0], "name": r[1], "values": r[2], "mode": r[3], "alert": r[4]} for r in rows]
+            rows = c.execute("SELECT id,name,vals,mode,alert,rep FROM monitors ORDER BY pos, name").fetchall()
+        self.monitors = [{"id": r[0], "name": r[1], "values": r[2], "mode": r[3], "alert": r[4], "rep": r[5]} for r in rows]
         self._cache.clear()
         self.notify()
 
@@ -203,7 +206,7 @@ class Store:
 
     # ---------- cálculo ----------
     def hits(self, m):
-        key = (self.version, m["mode"], tuple(m["values"]), tuple(self.segments_sig()))
+        key = (self.version, m["mode"], int(m.get("rep") or 2), tuple(m["values"]), tuple(self.segments_sig()))
         if key in self._cache:
             return self._cache[key]
         segmap = {s["id"]: s for s in self.segments}
@@ -211,6 +214,21 @@ class Store:
         codes, n = self.codes, len(self.codes)
         if not sets or n == 0:
             h = np.zeros(0, dtype=np.int64)
+        elif m["mode"] == "rep":
+            k = max(2, int(m.get("rep") or 2))
+            inset = np.isin(codes, np.unique(np.concatenate(sets)))
+            if n < k:
+                h = np.zeros(0, dtype=np.int64)
+            else:
+                eq = np.empty(n, dtype=bool)
+                eq[0] = False
+                eq[1:] = codes[1:] == codes[:-1]
+                acc = inset[k - 1:n].copy()
+                for j in range(1, k):
+                    acc &= inset[k - 1 - j:n - j]
+                for j in range(0, k - 1):
+                    acc &= eq[k - 1 - j:n - j]
+                h = np.flatnonzero(acc) + (k - 1)
         elif m["mode"] == "seq":
             k = len(sets)
             if n < k:
@@ -238,12 +256,38 @@ class Store:
         current = n if hits == 0 else int(n - 1 - h[-1])
         gaps = np.diff(h) - 1 if hits > 1 else np.zeros(0)
         record = max([current] + ([int(h[0])] if hits else []) + ([int(gaps.max())] if len(gaps) else []))
+        extra = {}
+        if m["mode"] == "rep":
+            k = max(2, int(m.get("rep") or 2))
+            _, lengths, cur_run = self.runs(m)
+            # cada sequência de iguais que parou antes de completar conta uma falha
+            extra = {"fails": int(np.count_nonzero((lengths >= 1) & (lengths < k))), "run": cur_run, "rep": k}
         return {
+            **extra,
             "n": n, "current": current, "record": record, "hits": hits,
             "avg": float(gaps.mean()) if len(gaps) else None,
             "lastT": float(times[h[-1]]) * 1000 if hits else None,
             "firstT": float(times[0]) * 1000 if n else None,
         }
+
+    def runs(self, m):
+        """Sequências de resultados iguais que estão entre os escolhidos (RLE)."""
+        with self.lock:
+            codes, n = self.codes, len(self.codes)
+            segmap = {s["id"]: s for s in self.segments}
+            sel = set()
+            for v in m["values"]:
+                if v in segmap:
+                    sel |= self.seg_codes(segmap[v])
+        if not n or not sel:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), 0
+        change = np.flatnonzero(codes[1:] != codes[:-1]) + 1
+        starts = np.concatenate([[0], change])
+        ends = np.concatenate([change, [n]])
+        lengths = ends - starts
+        keep = np.isin(codes[starts], np.array(sorted(sel), dtype=np.int32))
+        cur = int(lengths[-1]) if keep[-1] else 0
+        return starts[keep], lengths[keep], cur
 
     def running(self, m, idx):
         """Sequência logo após cada rodada de índice em idx (0 = saiu)."""
@@ -329,13 +373,13 @@ class Store:
     def upsert_monitor(self, m):
         with connect() as c:
             if m.get("id") and c.execute("SELECT 1 FROM monitors WHERE id=%s", (m["id"],)).fetchone():
-                c.execute("UPDATE monitors SET name=%s, vals=%s, mode=%s, alert=%s WHERE id=%s",
-                          (m["name"], Jsonb(m["values"]), m["mode"], m["alert"], m["id"]))
+                c.execute("UPDATE monitors SET name=%s, vals=%s, mode=%s, alert=%s, rep=%s WHERE id=%s",
+                          (m["name"], Jsonb(m["values"]), m["mode"], m["alert"], m.get("rep") or 2, m["id"]))
             else:
                 pos = c.execute("SELECT COALESCE(MAX(pos), -1) + 1 FROM monitors").fetchone()[0]
                 m["id"] = uuid.uuid4().hex[:10]
-                c.execute("INSERT INTO monitors(id,name,vals,mode,alert,pos) VALUES (%s,%s,%s,%s,%s,%s)",
-                          (m["id"], m["name"], Jsonb(m["values"]), m["mode"], m["alert"], pos))
+                c.execute("INSERT INTO monitors(id,name,vals,mode,alert,rep,pos) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                          (m["id"], m["name"], Jsonb(m["values"]), m["mode"], m["alert"], m.get("rep") or 2, pos))
         self.reload_config()
         return m["id"]
 
@@ -348,9 +392,10 @@ class Store:
         with connect() as c:
             c.execute("DELETE FROM monitors")
             for i, m in enumerate(monitors):
-                c.execute("INSERT INTO monitors(id,name,vals,mode,alert,pos) VALUES (%s,%s,%s,%s,%s,%s)",
+                c.execute("INSERT INTO monitors(id,name,vals,mode,alert,rep,pos) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                           (m.get("id") or uuid.uuid4().hex[:10], m["name"], Jsonb(m["values"]),
-                           "seq" if m.get("mode") == "seq" else "any", int(m.get("alert") or 0), i))
+                           m.get("mode") if m.get("mode") in ("seq", "rep") else "any",
+                           int(m.get("alert") or 0), int(m.get("rep") or 2), i))
         self.reload_config()
 
     def iter_rounds(self, since_epoch=None):

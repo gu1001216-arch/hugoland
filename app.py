@@ -153,8 +153,9 @@ def api_monitor_save():
     vals = [v for v in d.get("values", []) if v in seg_ids]
     if not vals:
         return jsonify(error="escolha pelo menos um resultado"), 400
-    m = {"id": d.get("id"), "name": (d.get("name") or "").strip()[:80] or "Combinação", "values": vals,
-         "mode": "seq" if d.get("mode") == "seq" else "any", "alert": max(0, int(d.get("alert") or 0))}
+    mode = d.get("mode") if d.get("mode") in ("seq", "rep") else "any"
+    m = {"id": d.get("id"), "name": (d.get("name") or "").strip()[:80] or "Combinação", "values": vals, "mode": mode,
+         "alert": max(0, int(d.get("alert") or 0)), "rep": min(20, max(2, int(d.get("rep") or 2)))}
     return jsonify(ok=True, id=store.upsert_monitor(m))
 
 
@@ -246,7 +247,11 @@ def export_rows(since):
 
 
 def mode_txt(m):
-    return "Zera quando sai a sequência" if m["mode"] == "seq" else "Zera quando sai qualquer um"
+    if m["mode"] == "seq":
+        return "Zera quando sai a sequência"
+    if m["mode"] == "rep":
+        return f"Zera quando o mesmo resultado repete {m.get('rep', 2)}x seguidas"
+    return "Zera quando sai qualquer um"
 
 
 @app.get("/api/export.xlsx")
@@ -257,11 +262,13 @@ def api_xlsx():
     wb = Workbook(write_only=True)
     segmap = {s["id"]: s["label"] for s in store.segments}
     ws = wb.create_sheet("Combinações")
-    ws.append(["Combinação", "Resultados", "Regra", "Sequência atual", "Recorde", "Vezes que saiu", "Média entre saídas", "Última saída", "Alerta"])
+    ws.append(["Combinação", "Resultados", "Regra", "Sequência atual", "Recorde", "Vezes que saiu", "Falhou (parou antes)",
+               "Iguais emendados agora", "Média entre saídas", "Última saída", "Alerta"])
     for m in store.monitors:
         st = store.stats(m)
         ws.append([m["name"], (" → " if m["mode"] == "seq" else ", ").join(segmap.get(v, "?") for v in m["values"]), mode_txt(m),
-                   st["current"], st["record"], st["hits"], round(st["avg"], 2) if st["avg"] is not None else None,
+                   st["current"], st["record"], st["hits"], st.get("fails"), st.get("run"),
+                   round(st["avg"], 2) if st["avg"] is not None else None,
                    local(st["lastT"] / 1000).strftime("%d/%m/%Y %H:%M:%S") if st["lastT"] else "nunca", m["alert"] or None])
     ws = wb.create_sheet("Rodadas")
     ws.append(["Nº", "Data", "Hora", "Resultado", "Código da fonte", "Origem"] + [f"Seq. {m['name']}" for m in store.monitors])
@@ -291,8 +298,8 @@ def api_json():
     def gen():
         head = {"app": "Hugoland", "versao": 3, "exportado_em": datetime.now(TZ).isoformat(), "periodo": label,
                 "combinacoes": [{"nome": m["name"], "resultados": [segmap.get(v, "?") for v in m["values"]],
-                                 "regra": "sequencia" if m["mode"] == "seq" else "qualquer_um", "alerta": m["alert"],
-                                 **{k: v for k, v in store.stats(m).items() if k in ("current", "record", "hits", "avg")}}
+                                 "regra": {"seq": "sequencia", "rep": f"repeticao_{m.get('rep', 2)}x"}.get(m["mode"], "qualquer_um"), "alerta": m["alert"],
+                                 **{k: v for k, v in store.stats(m).items() if k in ("current", "record", "hits", "avg", "fails", "run")}}
                                 for m in store.monitors]}
         yield json.dumps(head, ensure_ascii=False)[:-1] + ', "rodadas": ['
         names = [m["name"] for m in store.monitors]
@@ -364,7 +371,8 @@ def api_import():
                 if s:
                     vals.append(s["id"])
         if vals:
-            store.upsert_monitor({"name": m["name"], "values": vals, "mode": m.get("mode", "any"), "alert": int(m.get("alert") or 0)})
+            store.upsert_monitor({"name": m["name"], "values": vals, "mode": m.get("mode", "any"),
+                                  "alert": int(m.get("alert") or 0), "rep": int(m.get("rep") or 2)})
             added += 1
     return jsonify(ok=True, rodadas=new, combinacoes=added)
 

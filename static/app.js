@@ -28,7 +28,7 @@ const ball = (id, cls = '') => { const s = seg(id) || {label: '?', color: '#888'
 function fmtDur(ms){ const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = s % 60, p = n => String(n).padStart(2, '0'); return h ? `${h}:${p(m)}:${p(ss)}` : `${m}:${p(ss)}`; }
 const fmtDate = t => new Date(t).toLocaleDateString('pt-BR');
 const fmtTime = t => new Date(t).toLocaleTimeString('pt-BR');
-const ruleTxt = m => m.mode === 'seq' ? 'Zera quando sai a sequência' : 'Zera quando sai qualquer um';
+const ruleTxt = m => m.mode === 'seq' ? 'Zera quando sai a sequência' : m.mode === 'rep' ? `Zera quando o mesmo resultado repete ${m.rep}x seguidas` : 'Zera quando sai qualquer um';
 function toast(msg){ const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('on'), 2600); }
 const ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
 const ICON_DEL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>';
@@ -87,19 +87,22 @@ function renderGrid(){
     const pct = st.record ? Math.min(100, st.current / st.record * 100) : 0;
     const ref = st.lastT || st.firstT, plus = st.lastT ? '' : '+';
     const sep = m.mode === 'seq' ? '<span class="muted">→</span>' : '';
+    const chips = m.mode === 'rep' ? m.values.map(v => Array.from({length: m.rep}, () => chip(v)).join('')).join('<span class="muted">ou</span>') : m.values.map(chip).join(sep);
+    const s4 = m.mode === 'rep'
+      ? `<div>Falhou<b class="num" title="Vezes que a repetição começou e parou antes de completar">${(st.fails ?? 0).toLocaleString('pt-BR')}</b></div><div>Emendados<b class="num" title="Iguais seguidos neste momento">${st.run ?? 0}</b></div>`
+      : `<div>Saiu<b class="num">${st.hits.toLocaleString('pt-BR')}x</b></div><div>Média<b class="num">${st.avg == null ? '—' : st.avg.toFixed(1)}</b></div>`;
     return `<article class="combo ${hot ? 'hot' : ''} ${flashIds.has(m.id) ? 'flash' : ''}">
       <div class="c-head">
         <div><div class="c-name">${esc(m.name)}</div><div class="c-rule">${ruleTxt(m)}${m.alert ? ` · alerta em ${m.alert}` : ''}</div></div>
         <div class="c-act"><button class="icon" data-edit="${m.id}" aria-label="Editar ${esc(m.name)}">${ICON_EDIT}</button><button class="icon" data-del="${m.id}" aria-label="Excluir ${esc(m.name)}">${ICON_DEL}</button></div>
       </div>
-      <div class="chips">${m.values.map(chip).join(sep)}</div>
+      <div class="chips">${chips}</div>
       <div class="c-main"><div class="count num">${st.current.toLocaleString('pt-BR')}</div><div class="count-lbl">rodadas<br>sem sair</div></div>
       <div class="prog"><i style="width:${pct}%"></i></div>
       <div class="stats">
         <div>Recorde<b class="num">${st.record.toLocaleString('pt-BR')}</b></div>
         <div>Tempo<b class="num" data-tm="${ref || ''}" data-plus="${plus}">${ref ? fmtDur(now - ref) + plus : '—'}</b></div>
-        <div>Saiu<b class="num">${st.hits.toLocaleString('pt-BR')}x</b></div>
-        <div>Média<b class="num">${st.avg == null ? '—' : st.avg.toFixed(1)}</b></div>
+        ${s4}
       </div>
     </article>`;
   }).join('') + '<button class="add" data-new><span>+</span>Nova combinação</button>';
@@ -161,13 +164,15 @@ function openModal(id){
   $('#mTitle').textContent = m ? 'Editar combinação' : 'Nova combinação';
   $('#mName').value = m ? m.name : '';
   $('#mAlert').value = m ? m.alert : 0;
-  document.querySelector(`input[name=mode][value=${m && m.mode === 'seq' ? 'seq' : 'any'}]`).checked = true;
-  $('#mAdv').open = !!(m && m.mode === 'seq');
+  $('#mRep').value = m && m.rep ? m.rep : 2;
+  document.querySelector(`input[name=mode][value=${m && (m.mode === 'seq' || m.mode === 'rep') ? m.mode : 'any'}]`).checked = true;
   renderPick(); $('#modal').classList.add('on');
 }
 const closeModal = () => $('#modal').classList.remove('on');
+function currentMode(){ return document.querySelector('input[name=mode]:checked').value; }
 function renderPick(){
-  const seqMode = document.querySelector('input[name=mode]:checked').value === 'seq';
+  const seqMode = currentMode() === 'seq';
+  $('#repBox').style.display = currentMode() === 'rep' ? '' : 'none';
   $('#mPick').innerHTML = S.segments.map(s => { const i = pick.indexOf(s.id);
     return `<button class="${i > -1 ? 'on' : ''} ${isSmall(s.label) ? 'sm' : ''}" style="background:${s.color}" data-pick="${s.id}" aria-pressed="${i > -1}">${esc(s.label)}${i > -1 && seqMode ? `<span class="ord">${i + 1}</span>` : ''}</button>`; }).join('');
 }
@@ -178,10 +183,13 @@ $('#modal').addEventListener('click', e => { if(e.target.id === 'modal') closeMo
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closeModal(); });
 $('#mSave').addEventListener('click', async () => {
   if(!pick.length) return toast('Escolha pelo menos um resultado');
-  const mode = document.querySelector('input[name=mode]:checked').value;
-  const name = $('#mName').value.trim() || pick.map(segLabel).join(mode === 'seq' ? ' → ' : pick.length > 2 ? ', ' : ' e ');
+  const mode = currentMode(), repN = Math.min(20, Math.max(2, parseInt($('#mRep').value) || 2));
+  const auto = mode === 'seq' ? pick.map(segLabel).join(' → ')
+    : mode === 'rep' ? pick.map(l => Array.from({length: repN}, () => segLabel(l)).join(' ')).join(' ou ')
+    : pick.map(segLabel).join(pick.length > 2 ? ', ' : ' e ');
+  const name = $('#mName').value.trim() || auto;
   try{
-    await api('/api/monitors', {method: 'POST', body: JSON.stringify({id: editing, name, values: pick, mode, alert: parseInt($('#mAlert').value) || 0})});
+    await api('/api/monitors', {method: 'POST', body: JSON.stringify({id: editing, name, values: pick, mode, rep: repN, alert: parseInt($('#mAlert').value) || 0})});
     closeModal(); toast(editing ? 'Combinação atualizada' : 'Combinação criada'); await refresh();
     if($('#v-hist').classList.contains('on')) loadHist(true);
   }catch(e){ toast('Não salvou: ' + e.message); }

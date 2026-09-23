@@ -1,8 +1,19 @@
 # Hugoland na nuvem
 
 Painel web com coletor 24h do Adventures Beyond Wonderland. Grava todas as rodadas num PostgreSQL
-e calcula, para cada combinação, quantas rodadas seguidas estão sem sair (zera quando sai qualquer
-resultado da combinação). Acesso por link, com senha, em qualquer aparelho.
+e conta, para cada combinação, quantas rodadas seguidas estão sem sair. Acesso por link, com senha,
+em qualquer aparelho.
+
+## Regras de combinação
+
+| Regra | Zera quando | Exemplo |
+|---|---|---|
+| Qualquer um | sai qualquer resultado escolhido | 1 ou 2 |
+| Repetição | o mesmo resultado repete N vezes seguidas | 1 1, 1 1 1, 2 2 |
+| Sequência | os resultados saem nessa ordem, em rodadas seguidas | 1 → 2 → 10 |
+
+Nas combinações de repetição o cartão também mostra **Falhou** (quantas vezes a repetição começou
+e parou antes de completar) e **Emendados** (quantos iguais estão emendados agora).
 
 ## Publicar no Railway
 
